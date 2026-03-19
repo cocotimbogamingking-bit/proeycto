@@ -29,9 +29,12 @@ AUDIO_MODEL  = "whisper-large-v3"
 QC_BASE      = "https://d1loi7eremk1cu.cloudfront.net/"
 
 SYSTEM_PROMPT = (
-    "Eres un asistente inteligente y amigable disponible en Telegram. "
-    "Respondes siempre en español a menos que el usuario escriba en otro idioma. "
-    "Eres útil, conciso y con buena onda. Tienes memoria de la conversación."
+    "Eres un asistente amigable en Telegram, experto en zapatillas y ropa streetwear (reps). "
+    "Respondes siempre en español de forma útil y concisa. "
+    "Si notas explícita o implícitamente que el usuario quiere buscar zapatillas, un producto o ropa, "
+    "DEBES incluir en tu respuesta esta etiqueta exacta: <SEARCH>término_de_búsqueda</SEARCH>. "
+    "Por ejemplo: '¡Claro! Te busco eso enseguida. <SEARCH>nike air force 1</SEARCH>'. "
+    "La respuesta debe ser conversacional, y la etiqueta disparará automáticamente la búsqueda."
 )
 
 # ── Memory ────────────────────────────────────────────────────────────────────
@@ -94,6 +97,7 @@ def parse_product(p: dict) -> dict:
         'image':     p.get('mainImage', ''),
         'star':      p.get('star', 0),
         'qc_count':  p.get('qcImageCount', 0),
+        'qc_img':    qc_img,
         'shop':      p.get('shopName', ''),
         'is_new':    p.get('newFlag') == 1,
         'url_plug':  f'https://plug4.me/item/{wid}?channel=weidian',
@@ -125,11 +129,18 @@ def fmt_product(p: dict, idx: int) -> str:
     return f"*{idx}. {title}*{new}\n{price}\n{stars} | 📸 {p['qc_count']} fotos QC\n🏪 {p['shop']}"
 
 def product_kb(p: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
+    buttons = [
         InlineKeyboardButton("🔗 Plug4.me", url=p['url_plug']),
         InlineKeyboardButton("🛒 Hipobuy",  url=p['url_hipo']),
         InlineKeyboardButton("📋 Hipobuys", url=p['url_hipos']),
-    ]])
+    ]
+    if p.get('qc_img'):
+        buttons.insert(0, InlineKeyboardButton("📸 Foto QC Real", url=p['qc_img']))
+        keyboard = [[buttons[0], buttons[1]], [buttons[2], buttons[3]]]
+    else:
+        keyboard = [[buttons[0], buttons[1], buttons[2]]]
+        
+    return InlineKeyboardMarkup(keyboard)
 
 async def send_products(update: Update, products: list, header: str):
     await update.message.reply_text(header, parse_mode="Markdown")
@@ -260,23 +271,29 @@ async def cmd_precio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("❌ Error al buscar.")
 
 # ── Message handlers ──────────────────────────────────────────────────────────
-SEARCH_RE = re.compile(
-    r'\b(busca|buscar|busco|encuentra|muestra|quiero ver|reps?|replicas?)\b', re.IGNORECASE
-)
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     text = update.message.text
     await update.message.chat.send_action("typing")
-    if SEARCH_RE.search(text):
-        query = re.sub(SEARCH_RE, '', text).strip()
-        query = re.sub(r'[^\w\s]', '', query).strip()
-        if query:
-            ctx.args = query.split()
-            await cmd_buscar(update, ctx)
-            return
+            
     reply = await groq_chat(uid, text)
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    
+    # Verificamos si la IA decidió mandar a buscar algo
+    search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', reply, re.IGNORECASE)
+    
+    if search_match:
+        query = search_match.group(1).strip()
+        # Removemos la etiqueta del mensaje final
+        clean_reply = re.sub(r'<SEARCH>.*?</SEARCH>', '', reply, flags=re.IGNORECASE).strip()
+        
+        if clean_reply:
+            await update.message.reply_text(clean_reply, parse_mode="Markdown")
+            
+        ctx.args = query.split()
+        await cmd_buscar(update, ctx)
+    else:
+        await update.message.reply_text(reply, parse_mode="Markdown")
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
