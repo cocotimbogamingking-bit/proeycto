@@ -28,13 +28,30 @@ VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 AUDIO_MODEL  = "whisper-large-v3"
 QC_BASE      = "https://d1loi7eremk1cu.cloudfront.net/"
 
-SYSTEM_PROMPT = (
-    "Eres un asistente amigable en Telegram, experto en zapatillas y ropa streetwear (reps). "
-    "Respondes siempre en español de forma útil y concisa. "
-    "Si notas explícita o implícitamente que el usuario quiere buscar zapatillas, un producto o ropa, "
-    "DEBES incluir en tu respuesta esta etiqueta exacta: <SEARCH>término_de_búsqueda</SEARCH>. "
-    "Por ejemplo: '¡Claro! Te busco eso enseguida. <SEARCH>nike air force 1</SEARCH>'. "
-    "La respuesta debe ser conversacional, y la etiqueta disparará automáticamente la búsqueda."
+# Prompt para CHARLA normal (sin nada de tags)
+CHAT_SYSTEM_PROMPT = (
+    "Eres un asistente amigable en Telegram, experto en zapatillas y ropa streetwear (reps/réplicas). "
+    "Respondes SIEMPRE en español, de forma natural, breve y con buena vibra. NO incluyas ningún tag especial. "
+    "Puedes hablar de sneakers, ropa, precios, tallas, combinar outfits, o cualquier otro tema. "
+    "Si el usuario pregunta cómo buscar productos, díle que simplemente lo pida natural: 'quiero ver unas nike dunk'."
+)
+
+# Prompt para el CLASIFICADOR de intención (responde solo JSON)
+CLASSIFIER_PROMPT = (
+    "Eres un clasificador de intención. Analiza el mensaje del usuario y devuelve SOLO un JSON, sin ningún texto extra.\n"
+    "Si el usuario quiere buscar/ver/encontrar un producto específico: {\"intent\": \"search\", \"query\": \"término_exacto\"}\n"
+    "Si es saludo, charla, pregunta general, opinión o cualquier otra cosa: {\"intent\": \"chat\"}\n"
+    "EJEMPLOS:\n"
+    "- 'hola' -> {\"intent\": \"chat\"}\n"
+    "- 'holaaa' -> {\"intent\": \"chat\"}\n"
+    "- 'qué tal' -> {\"intent\": \"chat\"}\n"
+    "- 'quiero ver jordan 1' -> {\"intent\": \"search\", \"query\": \"jordan 1\"}\n"
+    "- 'busca yeezy 350' -> {\"intent\": \"search\", \"query\": \"yeezy 350\"}\n"
+    "- 'tienes reps de nike dunk' -> {\"intent\": \"search\", \"query\": \"nike dunk\"}\n"
+    "- 'cuánto cuestan las air force' -> {\"intent\": \"search\", \"query\": \"air force 1\"}\n"
+    "- 'son buenas las reps de weidian' -> {\"intent\": \"chat\"}\n"
+    "- 'me puedes buscar unas new balance 550' -> {\"intent\": \"search\", \"query\": \"new balance 550\"}\n"
+    "SOLO devuelve el JSON, nada más."
 )
 
 # ── Memory ────────────────────────────────────────────────────────────────────
@@ -53,11 +70,18 @@ def add_msg(uid: int, role: str, content):
 
 # ── Search ────────────────────────────────────────────────────────────────────
 ALIASES = [
-    (r'\baf[ -]?1\b',    'air force 1'),
-    (r'\byzy\b',         'yeezy'),
-    (r'\bnb\b',          'new balance'),
-    (r'\bj[ -]?1\b',     'jordan 1'),
-    (r'\bdunk\b',        'nike dunk'),
+    (r'\baf[ -]?1\b',          'air force 1'),
+    (r'\byzy\b',               'yeezy'),
+    (r'\bnb\b',                'new balance'),
+    (r'\bj[ -]?1\b',           'jordan 1'),
+    (r'\bdunk(s?)\b',          'nike dunk'),
+    (r'\btech[ -]?fleece\b',   'nike tech fleece'),
+    (r'\baj[ -]?(\d+)\b',      'air jordan \\1'),
+    (r'\bnmds?\b',             'adidas nmd'),
+    (r'\bultra ?boost\b',      'adidas ultraboost'),
+    (r'\bpanda(s?)\b',         'nike dunk panda'),
+    (r'\b550s?\b',             'new balance 550'),
+    (r'\b990s?\b',             'new balance 990'),
 ]
 
 def normalize(q: str) -> str:
@@ -160,7 +184,7 @@ async def send_products(update: Update, products: list, header: str):
 async def groq_chat(uid: int, user_msg) -> str:
     add_msg(uid, "user", user_msg)
     model    = VISION_MODEL if isinstance(user_msg, list) else TEXT_MODEL
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_history(uid)
+    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + get_history(uid)
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(GROQ_CHAT_URL, headers=GROQ_HEADERS,
                               json={"model": model, "messages": messages, "max_tokens": 1024})
@@ -168,6 +192,26 @@ async def groq_chat(uid: int, user_msg) -> str:
         reply = r.json()["choices"][0]["message"]["content"]
     add_msg(uid, "assistant", reply)
     return reply
+
+async def groq_classify(text: str) -> dict:
+    """Clasifica si el mensaje es búsqueda o charla. Devuelve {'intent': 'search'/'chat', 'query': '...'}"""
+    import json
+    messages = [
+        {"role": "system", "content": CLASSIFIER_PROMPT},
+        {"role": "user",   "content": text},
+    ]
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(GROQ_CHAT_URL, headers=GROQ_HEADERS,
+                              json={"model": TEXT_MODEL, "messages": messages,
+                                    "max_tokens": 80, "temperature": 0})
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+    try:
+        # Extraemos el JSON aunque venga con texto extra
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        return json.loads(match.group()) if match else {"intent": "chat"}
+    except Exception:
+        return {"intent": "chat"}
 
 async def groq_transcribe(audio: bytes) -> str:
     async with httpx.AsyncClient(timeout=60) as client:
@@ -276,24 +320,26 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     text = update.message.text
     await update.message.chat.send_action("typing")
-            
-    reply = await groq_chat(uid, text)
-    
-    # Verificamos si la IA decidió mandar a buscar algo
-    search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', reply, re.IGNORECASE)
-    
-    if search_match:
-        query = search_match.group(1).strip()
-        # Removemos la etiqueta del mensaje final
-        clean_reply = re.sub(r'<SEARCH>.*?</SEARCH>', '', reply, flags=re.IGNORECASE).strip()
-        
-        if clean_reply:
-            await update.message.reply_text(clean_reply, parse_mode="Markdown")
-            
-        ctx.args = query.split()
-        await cmd_buscar(update, ctx)
-    else:
-        await update.message.reply_text(reply, parse_mode="Markdown")
+
+    try:
+        # Paso 1: clasificar la intencion (es búsqueda o charla?)
+        classification = await groq_classify(text)
+        intent = classification.get("intent", "chat")
+        query  = classification.get("query", "").strip()
+
+        if intent == "search" and len(query) > 2:
+            # Es una búsqueda - confirmar y buscar
+            await update.message.reply_text(f"🔍 Buscando *{query}*...", parse_mode="Markdown")
+            ctx.args = query.split()
+            await cmd_buscar(update, ctx)
+        else:
+            # Es charla normal - responder con la IA
+            reply = await groq_chat(uid, text)
+            await update.message.reply_text(reply, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Error en handle_text: {e}")
+        await update.message.reply_text("😔 Algo salió mal, inténtalo de nuevo.")
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
