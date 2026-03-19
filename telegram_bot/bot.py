@@ -1738,7 +1738,7 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
     # ── Decide mode: WEBHOOK or POLLING ───────────────────────────
-    deploy_mode = os.environ.get("DEPLOY_MODE", "polling").lower().strip()
+    deploy_mode = os.environ.get("DEPLOY_MODE", "webhook").lower().strip()
     webhook_url = get_webhook_url()
 
     if deploy_mode == "webhook" and webhook_url:
