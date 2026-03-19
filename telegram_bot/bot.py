@@ -38,8 +38,8 @@ logging.basicConfig(
 logger = logging.getLogger("RepBot")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8786285615:AAGZw_Wx50V3Kdez8QG8ugJLPVfYdfxrFvk")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -56,7 +56,7 @@ QC_BASE = "https://d1loi7eremk1cu.cloudfront.net/"
 # Limits
 MAX_HISTORY_PER_USER = 20
 MAX_ACTIVE_USERS = 500
-RATE_LIMIT_SECONDS = 3  # Minimum seconds between requests per user
+RATE_LIMIT_SECONDS = 2  # Minimum seconds between search requests per user
 SEARCH_CACHE_TTL = 300  # 5 minutes
 MAX_RETRIES = 2
 RETRY_DELAY = 1.0  # seconds
@@ -1186,7 +1186,12 @@ async def groq_describe(image_bytes: bytes, mime: str = "image/jpeg") -> str:
     """Describe an image using Groq Vision model."""
     b64 = base64.b64encode(image_bytes).decode()
     content = [
-        {"type": "text", "text": "Describe esta imagen detalladamente. Si hay texto, transcríbelo. Si hay un producto (zapatilla, ropa), identifícalo."},
+        {"type": "text", "text": (
+            "Describe esta imagen. Si contiene un producto (zapatilla, ropa, bolso, accesorio), "
+            "identifica la MARCA y MODELO exacto (ejemplo: 'Nike Air Jordan 4 Military Blue', "
+            "'Adidas Yeezy 350 Zebra', 'Louis Vuitton Neverfull'). "
+            "Si hay texto visible, transcríbelo."
+        )},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
     ]
     try:
@@ -1204,6 +1209,44 @@ async def groq_describe(image_bytes: bytes, mime: str = "image/jpeg") -> str:
     except Exception as e:
         logger.error(f"Vision describe error: {e}")
         return "No pude analizar la imagen."
+
+
+async def groq_identify_product(description: str) -> str:
+    """Extract a searchable product name from an image description."""
+    messages = [
+        {"role": "system", "content": (
+            "Eres un experto en identificar productos de moda, zapatillas y ropa. "
+            "A partir de una descripción de imagen, extrae el nombre del producto para búsqueda. "
+            "Devuelve SOLO el nombre del producto en inglés, corto y buscable. "
+            "Ejemplos: 'jordan 4 military blue', 'nike dunk panda', 'yeezy 350 zebra', "
+            "'louis vuitton neverfull', 'nike tech fleece grey'. "
+            "Si no puedes identificar el producto, devuelve 'unknown'. "
+            "SOLO el nombre, nada más."
+        )},
+        {"role": "user", "content": f"Identifica el producto en esta descripción: {description}"},
+    ]
+    try:
+        resp = await api_request_with_retry(
+            "POST",
+            GROQ_CHAT_URL,
+            headers=GROQ_HEADERS,
+            json={
+                "model": TEXT_MODEL,
+                "messages": messages,
+                "max_tokens": 50,
+                "temperature": 0,
+            },
+            retries=1,
+        )
+        result = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        # Clean up: remove quotes, periods
+        result = result.strip('"\'.').strip()
+        if result.lower() == "unknown" or len(result) < 3:
+            return ""
+        return result
+    except Exception as e:
+        logger.error(f"Product identification error: {e}")
+        return ""
 
 
 async def download_file(bot, file_id: str) -> bytes:
@@ -1484,8 +1527,26 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("😔 Error procesando el audio.")
 
 
+# Palabras clave que indican que el usuario quiere buscar un producto de la foto
+_PHOTO_SEARCH_KEYWORDS = {
+    'busca', 'buscame', 'buscar', 'encuentra', 'encontrar', 'quiero',
+    'estas', 'estos', 'esas', 'esos', 'asi', 'así', 'haci', 'asì',
+    'donde', 'dónde', 'consigo', 'conseguir', 'comprar', 'compro',
+    'tienen', 'tienes', 'hay', 'link', 'enlace', 'w2c', 'wtc',
+    'find', 'search', 'cop', 'get', 'want', 'need',
+}
+
+
+def _caption_wants_search(caption: str) -> bool:
+    """Check if a photo caption implies the user wants to search for the product."""
+    if not caption:
+        return False
+    words = set(re.sub(r'[^\w\s]', '', caption.lower()).split())
+    return bool(words & _PHOTO_SEARCH_KEYWORDS)
+
+
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle photos: describe, check caption for search intent."""
+    """Handle photos: identify product from image when user wants to search."""
     uid = update.effective_user.id
     await update.message.chat.send_action("typing")
 
@@ -1498,24 +1559,31 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         desc = await groq_describe(image_bytes)
         caption = update.message.caption or ""
 
-        # ── NEW: Check if caption implies a search ──
-        if caption:
-            classification = await groq_classify(caption)
-            intent = classification.get("intent", "chat")
-            query = classification.get("query", "").strip()
-
-            if intent == "search" and len(query) > 2:
-                if not rate_limiter.check(uid):
-                    remaining = rate_limiter.remaining(uid)
-                    await update.message.reply_text(f"⏳ Espera {remaining:.0f}s.")
-                    return
-
-                await update.message.reply_text(f"📷 Vi la imagen. 🔍 Buscando '{escape_md(query)}'...")
-                ctx.args = query.split()
-                await cmd_buscar(update, ctx)
+        # ── Check if user wants to search for the product in the photo ──
+        if _caption_wants_search(caption):
+            if not rate_limiter.check(uid):
+                remaining = rate_limiter.remaining(uid)
+                await update.message.reply_text(f"⏳ Espera {remaining:.0f}s.")
                 return
 
-        # Normal image chat
+            # Use AI to identify the product from the image description
+            product_name = await groq_identify_product(desc)
+
+            if product_name:
+                await update.message.reply_text(
+                    f"📷 Identifiqué: *{escape_md(product_name)}*\n🔍 Buscando..."
+                )
+                ctx.args = product_name.split()
+                await cmd_buscar(update, ctx)
+            else:
+                # Couldn't identify — fallback to chat about the image
+                await update.message.reply_text(
+                    "📷 No pude identificar el producto exacto de la foto.\n"
+                    "💡 Prueba escribiendo el nombre directamente, ej: _jordan 4 military blue_"
+                )
+            return
+
+        # Normal image chat (no search intent)
         prompt = f"[Imagen enviada por el usuario]: {desc}"
         if caption:
             prompt += f"\n[Caption del usuario]: {caption}"
@@ -1568,7 +1636,7 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HealthHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler for Render health checks."""
+    """Simple HTTP handler for platform health checks."""
 
     def do_GET(self):
         self.send_response(200)
@@ -1576,12 +1644,16 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, format, *args):
         pass  # Suppress HTTP access logs
 
 
 def keep_alive():
-    """Start a lightweight HTTP server for Render's health check."""
+    """Start a lightweight HTTP server for platform health checks."""
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1597,8 +1669,43 @@ async def on_shutdown(app):
         logger.info("HTTP client closed.")
 
 
+async def post_init(application):
+    """Runs after bot is initialized — cleans up any previous webhook/polling session."""
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted and pending updates dropped on startup.")
+    except Exception as e:
+        logger.warning(f"Could not delete webhook on startup: {e}")
+
+
+def get_webhook_url() -> str | None:
+    """Auto-detect the external URL from common platform env vars."""
+    # Check explicit setting first
+    url = os.environ.get("WEBHOOK_URL", "").strip()
+    if url:
+        return url.rstrip("/")
+
+    # Koyeb provides the app's public URL
+    koyeb_url = os.environ.get("KOYEB_PUBLIC_DOMAIN", "").strip()
+    if koyeb_url:
+        return f"https://{koyeb_url}"
+
+    # Railway provides the public domain
+    railway_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if railway_url:
+        return f"https://{railway_url}"
+
+    # Render provides the external URL
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    if render_url:
+        return render_url.rstrip("/")
+
+    return None
+
+
 def main():
-    """Initialize and run the bot."""
+    """Initialize and run the bot in either POLLING or WEBHOOK mode."""
+
     try:
         asyncio.get_event_loop()
     except RuntimeError:
@@ -1606,8 +1713,15 @@ def main():
 
     keep_alive()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Build the application with post_init to cleanup previous sessions
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
+    # ── Register Handlers ─────────────────────────────────────────
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
@@ -1623,9 +1737,40 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
-    logger.info("🤖 RepBot started successfully!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # ── Decide mode: WEBHOOK or POLLING ───────────────────────────
+    deploy_mode = os.environ.get("DEPLOY_MODE", "polling").lower().strip()
+    webhook_url = get_webhook_url()
+
+    if deploy_mode == "webhook" and webhook_url:
+        # ── WEBHOOK MODE ──────────────────────────────────────────
+        # No polling = NO conflict errors, ever!
+        port = int(os.environ.get("PORT", 8080))
+        webhook_path = f"/webhook/{TELEGRAM_TOKEN}"
+        full_webhook_url = f"{webhook_url}{webhook_path}"
+
+        logger.info(f"Starting in WEBHOOK mode on port {port}")
+        logger.info(f"Webhook URL: {full_webhook_url}")
+
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=full_webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    else:
+        # ── POLLING MODE ──────────────────────────────────────────
+        # Good for local development or single-instance platforms
+        logger.info("Starting in POLLING mode...")
+
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,        # <-- Ignores old messages
+            close_loop=False,
+        )
 
 
 if __name__ == "__main__":
     main()
+
